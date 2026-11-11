@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RuntimeIdentifier>win-arm64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <AssemblyName>Muse</AssemblyName>
+    <RootNamespace>MuseDesktop</RootNamespace>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Version>2.3.1</Version>
+    <Product>Muse</Product>
+    <Description>Muse desktop app for Windows on ARM — muse.ai in its own window, plus the Muse Bridge for local files, Resolve and Adobe Express.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- WPF's implicit System.Windows.Shapes would make "Path" ambiguous
+         with System.IO.Path throughout the WinForms code. -->
+    <Using Remove="System.Windows.Shapes" />
+    <Using Remove="System.Windows.Navigation" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Windows UI Automation, for driving apps that have no API
+         (Adobe Express PWA, Resolve menus, anything else). -->
+    <Reference Include="UIAutomationClient" />
+    <Reference Include="UIAutomationTypes" />
+    <Reference Include="UIAutomationProvider" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="helpers\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>
