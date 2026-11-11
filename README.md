@@ -7,6 +7,8 @@ Meta ships Muse apps for Mac, iOS, and Android, but (as of November 2026) there 
 > **Not affiliated with Meta.** This is a community project. It is also *not* for Muse Code (Meta's separate terminal coding agent) — this is for the personal Muse agent.
 >
 > Built by [Tré Shepard](https://www.youtube.com/@ShepardBrosFilms) (Shepard Bros Films) together with his Muse, on a Snapdragon-powered ASUS Zenbook A14 — and shared so you can do the same with yours.
+>
+> **Disclosure — built with Muse:** This project was created by Tré Shepard utilizing Muse, Meta's personal AI agent. Muse assisted extensively with writing the code, documentation, and setup guides in this repository, under Tré's direction, testing, and review. Tré is the author and maintainer of record and is responsible for this project and anything published here.
 
 ## Download
 
