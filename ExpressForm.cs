@@ -32,12 +32,31 @@ public sealed class ExpressForm : Form
                     browserExecutableFolder: null,
                     userDataFolder: Path.Combine(dataDir, "WebView2-Express"));
                 await _web.EnsureCoreWebView2Async(env);
+                // Adobe hosts stay in this window; any other site opens
+                // in the user's default browser rather than inside the
+                // signed-in Adobe session.
                 _web.CoreWebView2.NewWindowRequested += (_, args) =>
                 {
                     args.Handled = true;
-                    if (!string.IsNullOrEmpty(args.Uri))
+                    if (string.IsNullOrEmpty(args.Uri))
+                    {
+                        return;
+                    }
+                    if (WebNavigation.MayNavigateInApp(args.Uri, WebNavigation.IsAdobeHost))
                     {
                         _web.CoreWebView2.Navigate(args.Uri);
+                    }
+                    else
+                    {
+                        WebNavigation.OpenInDefaultBrowser(args.Uri);
+                    }
+                };
+                _web.CoreWebView2.NavigationStarting += (_, args) =>
+                {
+                    if (!WebNavigation.MayNavigateInApp(args.Uri, WebNavigation.IsAdobeHost))
+                    {
+                        args.Cancel = true;
+                        WebNavigation.OpenInDefaultBrowser(args.Uri);
                     }
                 };
                 _ready = true;

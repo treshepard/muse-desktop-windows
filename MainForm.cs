@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using Microsoft.Win32;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -24,6 +25,18 @@ public sealed class MainForm : Form
         "MuseDesktop");
 
     private string SettingsPath => Path.Combine(_dataDir, "window.json");
+    private string AppSettingsPath => Path.Combine(_dataDir, "settings.json");
+
+    // Global hotkey plumbing (see AppSettings.cs). Ids are arbitrary;
+    // they come back in WndProc as the WM_HOTKEY wParam.
+    private const int WmHotkey = 0x0312;
+    private const int HotkeyBringToFrontId = 1;
+    private const int HotkeyMuteId = 2;
+
+    private AppSettings _settings = new();
+    private bool _hotkeysRegistered;
+    private ToolStripMenuItem? _hotkeysItem;
+    private ToolStripMenuItem? _startOnLoginItem;
 
     private BridgeServer? _bridge;
     private NotifyIcon? _tray;
@@ -43,12 +56,41 @@ public sealed class MainForm : Form
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
         BuildNavBar();
         StartBridge();
+        _settings = AppSettings.Load(AppSettingsPath);
+        ApplyStartOnLogin();
         SetupTray();
 
         RestoreSavedBounds();
 
         Load += OnLoad;
         FormClosing += OnClosing;
+        Resize += OnResize;
+    }
+
+    // Minimizing tucks the window into the tray instead of the
+    // taskbar. The form is only hidden, never closed or disposed,
+    // so the WebView session — including a live voice call — keeps
+    // running untouched. The tray icon (or a second launch) brings
+    // it back through Surface().
+    private void OnResize(object? sender, EventArgs e)
+    {
+        if (WindowState == FormWindowState.Minimized)
+        {
+            Hide();
+        }
+    }
+
+    // Called by Program when a second launch asks this instance to
+    // come to the front instead of starting alongside it.
+    public void Surface()
+    {
+        if (WindowState == FormWindowState.Minimized)
+        {
+            WindowState = FormWindowState.Normal;
+        }
+        Show();
+        Activate();
+        BringToFront();
     }
 
     // ---------- Navigation (v2.3, Opera GX style) ----------
@@ -223,8 +265,93 @@ public sealed class MainForm : Form
         return base.ProcessCmdKey(ref msg, keyData);
     }
 
+    // ---------- Global hotkeys ----------
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WmHotkey)
+        {
+            var id = m.WParam.ToInt32();
+            if (id == HotkeyBringToFrontId)
+            {
+                Surface();
+                return;
+            }
+            if (id == HotkeyMuteId)
+            {
+                _ = ToggleMuteAsync();
+                return;
+            }
+        }
+        base.WndProc(ref m);
+    }
+
+    // Registration happens only when the user has enabled hotkeys;
+    // a combination another app already owns simply fails to
+    // register and the other one still can.
+    private void RegisterConfiguredHotkeys()
+    {
+        UnregisterConfiguredHotkeys();
+        if (!_settings.HotkeysEnabled)
+        {
+            return;
+        }
+        var front = GlobalHotkey.Register(Handle, HotkeyBringToFrontId, _settings.BringToFrontHotkey);
+        var mute = GlobalHotkey.Register(Handle, HotkeyMuteId, _settings.MuteHotkey);
+        _hotkeysRegistered = front || mute;
+    }
+
+    private void UnregisterConfiguredHotkeys()
+    {
+        if (!_hotkeysRegistered)
+        {
+            return;
+        }
+        GlobalHotkey.Unregister(Handle, HotkeyBringToFrontId);
+        GlobalHotkey.Unregister(Handle, HotkeyMuteId);
+        _hotkeysRegistered = false;
+    }
+
+    private const string MuteScript = """
+        (() => {
+          const els = document.querySelectorAll('button, [role="button"]');
+          for (const el of els) {
+            const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.title || '')).toLowerCase();
+            if (label.includes('mute') && !label.includes('notification')) {
+              el.click();
+              return 'toggled';
+            }
+          }
+          return 'not-found';
+        })()
+        """;
+
+    // The mute toggle behind the global hotkey and the tray entry.
+    // It clicks the page's own microphone button — a button whose
+    // label mentions muting. If no such control can be found (the
+    // page changed, or no call controls are on screen), it surfaces
+    // the window instead, so the key press is never a silent no-op.
+    private async Task ToggleMuteAsync()
+    {
+        try
+        {
+            var core = _web.CoreWebView2;
+            if (core is not null)
+            {
+                var result = await core.ExecuteScriptAsync(MuteScript);
+                if (result is not null && !result.Contains("not-found"))
+                {
+                    return;
+                }
+            }
+        }
+        catch { /* fall through to surfacing the window */ }
+        Surface();
+    }
+
     private async void OnLoad(object? sender, EventArgs e)
     {
+        RegisterConfiguredHotkeys();
         try
         {
             Directory.CreateDirectory(_dataDir);
@@ -236,19 +363,48 @@ public sealed class MainForm : Form
             var core = _web.CoreWebView2;
             core.Settings.AreDevToolsEnabled = false;
 
-            // Links that would open a new window stay inside the app instead.
+            // Decide permission requests (microphone for voice chat,
+            // camera, location, ...) ourselves instead of leaving the
+            // WebView default in charge.
+            core.PermissionRequested += OnPermissionRequested;
+
+            // Links that would open a new window stay inside the app
+            // instead — but only for Muse and its sign-in hosts. Any
+            // other site opens in the user's default browser rather
+            // than inside this window's signed-in profile.
             core.NewWindowRequested += (_, args) =>
             {
                 args.Handled = true;
-                if (!string.IsNullOrEmpty(args.Uri))
+                if (string.IsNullOrEmpty(args.Uri))
+                {
+                    return;
+                }
+                if (WebNavigation.MayNavigateInApp(args.Uri, WebNavigation.IsMuseHost))
                 {
                     core.Navigate(args.Uri);
+                }
+                else
+                {
+                    WebNavigation.OpenInDefaultBrowser(args.Uri);
+                }
+            };
+
+            // Same allowlist for in-window navigation: following a link
+            // out of Muse cancels the navigation here and opens the
+            // page in the default browser instead.
+            core.NavigationStarting += (_, args) =>
+            {
+                if (!WebNavigation.MayNavigateInApp(args.Uri, WebNavigation.IsMuseHost))
+                {
+                    args.Cancel = true;
+                    WebNavigation.OpenInDefaultBrowser(args.Uri);
                 }
             };
 
             // Keep the nav bar's back/forward state and URL current.
             core.NavigationStarting += (_, _) => UpdateNavState();
-            core.NavigationCompleted += (_, _) => UpdateNavState();
+            core.NavigationCompleted += OnNavigationCompleted;
+            core.ProcessFailed += OnWebViewProcessFailed;
             core.SourceChanged += (_, _) => UpdateNavState();
             core.HistoryChanged += (_, _) => UpdateNavState();
 
@@ -265,6 +421,90 @@ public sealed class MainForm : Form
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
         }
+    }
+
+    // The only permission this window grants is the microphone, and
+    // only to Muse itself (voice chat). Everything else — camera,
+    // location, notifications, and any permission asked for by another
+    // origin — is denied. SavesInProfile stores the decision in the
+    // WebView profile, so the choice is made once instead of the
+    // prompt coming back every session.
+    private void OnPermissionRequested(object? sender, CoreWebView2PermissionRequestedEventArgs args)
+    {
+        var allow = args.PermissionKind == CoreWebView2PermissionKind.Microphone
+            && Uri.TryCreate(args.Uri, UriKind.Absolute, out var origin)
+            && WebNavigation.IsMuseHost(origin.Host);
+        args.State = allow
+            ? CoreWebView2PermissionState.Allow
+            : CoreWebView2PermissionState.Deny;
+        args.SavesInProfile = true;
+    }
+
+    // ---------- Reconnect resilience ----------
+
+    private string? _lastGoodUrl;
+    private bool _restoreAttempted;
+
+    // Every successful load of a Muse page becomes the place to
+    // return to. A failed navigation (network drop, a reload that
+    // lands wrong) restores it once; if the restore also fails the
+    // flag stays set, so a dead network cannot spin a reload loop.
+    // The next successful load clears the flag and moves the mark.
+    private void OnNavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs args)
+    {
+        UpdateNavState();
+        var core = _web.CoreWebView2;
+        if (core is null)
+        {
+            return;
+        }
+        if (args.IsSuccess)
+        {
+            _restoreAttempted = false;
+            var source = core.Source;
+            if (!string.IsNullOrEmpty(source)
+                && WebNavigation.MayNavigateInApp(source, WebNavigation.IsMuseHost))
+            {
+                _lastGoodUrl = source;
+            }
+            return;
+        }
+        // A navigation the user (or a newer navigation) cancelled is
+        // not a failure to recover from.
+        if (args.WebErrorStatus != CoreWebView2WebErrorStatus.OperationCanceled)
+        {
+            RestoreLastGoodPage(core);
+        }
+    }
+
+    private void OnWebViewProcessFailed(object? sender, CoreWebView2ProcessFailedEventArgs args)
+    {
+        // Only a dead browser or renderer process leaves the page
+        // unusable; frame-level failures recover inside the page.
+        if (args.ProcessFailedKind != CoreWebView2ProcessFailedKind.BrowserProcessExited
+            && args.ProcessFailedKind != CoreWebView2ProcessFailedKind.RenderProcessExited)
+        {
+            return;
+        }
+        var core = _web.CoreWebView2;
+        if (core is not null)
+        {
+            RestoreLastGoodPage(core);
+        }
+    }
+
+    private void RestoreLastGoodPage(CoreWebView2 core)
+    {
+        if (_restoreAttempted)
+        {
+            return;
+        }
+        _restoreAttempted = true;
+        try
+        {
+            core.Navigate(_lastGoodUrl ?? HomeUrl);
+        }
+        catch { /* a later successful load resets the flag */ }
     }
 
     // ---------- Muse Bridge (v2) ----------
@@ -308,6 +548,39 @@ public sealed class MainForm : Form
 
     private string? LastBridgeError { get; set; }
 
+    // ---------- Start on login (opt-in) ----------
+
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string RunValueName = "Muse";
+
+    // Keeps the per-user Run key in line with the setting: the value
+    // exists only while the user has the toggle on, and points at
+    // wherever the app currently runs from. Runs at startup too, so
+    // moving the app heals the entry instead of stranding it.
+    private void ApplyStartOnLogin()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
+            if (key is null)
+            {
+                return;
+            }
+            if (_settings.StartOnLogin)
+            {
+                key.SetValue(RunValueName, "\"" + Application.ExecutablePath + "\"");
+            }
+            else
+            {
+                key.DeleteValue(RunValueName, throwOnMissingValue: false);
+            }
+        }
+        catch
+        {
+            // A failed preference must never take the app down.
+        }
+    }
+
     private void ShowExpressWindow()
     {
         _expressForm ??= new ExpressForm(_dataDir);
@@ -321,6 +594,9 @@ public sealed class MainForm : Form
     private void SetupTray()
     {
         var menu = new ContextMenuStrip();
+        menu.Items.Add("Open Muse", null, (_, _) => Surface());
+        menu.Items.Add("Mute / unmute", null, (_, _) => _ = ToggleMuteAsync());
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Bridge status…", null, (_, _) => ShowBridgeStatus());
         menu.Items.Add("Open Adobe Express window", null, (_, _) => ShowExpressWindow());
         menu.Items.Add(new ToolStripSeparator());
@@ -333,6 +609,30 @@ public sealed class MainForm : Form
             UpdateTrayText();
         };
         menu.Items.Add(pauseItem);
+        _hotkeysItem = new ToolStripMenuItem("Enable global hotkeys")
+        {
+            Checked = _settings.HotkeysEnabled,
+        };
+        _hotkeysItem.Click += (_, _) =>
+        {
+            _settings.HotkeysEnabled = !_settings.HotkeysEnabled;
+            _hotkeysItem.Checked = _settings.HotkeysEnabled;
+            _settings.Save(AppSettingsPath);
+            RegisterConfiguredHotkeys();
+        };
+        menu.Items.Add(_hotkeysItem);
+        _startOnLoginItem = new ToolStripMenuItem("Start on login")
+        {
+            Checked = _settings.StartOnLogin,
+        };
+        _startOnLoginItem.Click += (_, _) =>
+        {
+            _settings.StartOnLogin = !_settings.StartOnLogin;
+            _startOnLoginItem.Checked = _settings.StartOnLogin;
+            _settings.Save(AppSettingsPath);
+            ApplyStartOnLogin();
+        };
+        menu.Items.Add(_startOnLoginItem);
         menu.Items.Add("Quit Muse", null, (_, _) => Close());
 
         _tray = new NotifyIcon
@@ -341,7 +641,7 @@ public sealed class MainForm : Form
             ContextMenuStrip = menu,
             Visible = true,
         };
-        _tray.DoubleClick += (_, _) => ShowBridgeStatus();
+        _tray.DoubleClick += (_, _) => Surface();
         UpdateTrayText();
     }
 
@@ -439,6 +739,7 @@ public sealed class MainForm : Form
     {
         try
         {
+            UnregisterConfiguredHotkeys();
             if (_tray is not null) { _tray.Visible = false; _tray.Dispose(); }
             _bridge?.Dispose();
         }

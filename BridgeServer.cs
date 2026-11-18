@@ -9,7 +9,9 @@ using System.Drawing.Imaging;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Windows.Automation;
@@ -30,8 +32,13 @@ public sealed class BridgeServer : IDisposable
     public const int Port = 8765;
     private const long MaxBodyBytes = 64 * 1024 * 1024;
     private const long MaxReadFileBytes = 25 * 1024 * 1024;
+    private const long MaxLogBytes = 5 * 1024 * 1024;
+    private const int LogBackupCount = 3;
+    private const int MaxConcurrentConnections = 16;
+    private const int RequestReadDeadlineSeconds = 60;
 
     private readonly TcpListener _listener;
+    private readonly SemaphoreSlim _connectionSlots = new(MaxConcurrentConnections, MaxConcurrentConnections);
     private readonly CancellationTokenSource _stop = new();
     private readonly string _dataDir;
     private readonly object _logLock = new();
@@ -63,6 +70,18 @@ public sealed class BridgeServer : IDisposable
         if (string.IsNullOrEmpty(value)) return "";
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(value));
         return Convert.ToHexString(hash)[..8].ToLowerInvariant();
+    }
+
+    // Constant-time check of the full "Bearer <token>" header against the
+    // expected value. Lengths are compared first, so FixedTimeEquals is
+    // only ever called on equal-length inputs and a missing or malformed
+    // header simply fails the check.
+    private bool IsAuthorized(Request req)
+    {
+        var expected = Encoding.UTF8.GetBytes("Bearer " + Token);
+        var provided = Encoding.UTF8.GetBytes(req.Auth ?? "");
+        if (provided.Length != expected.Length) return false;
+        return CryptographicOperations.FixedTimeEquals(provided, expected);
     }
 
     private void RecordAuthFailure(Request req)
@@ -101,7 +120,7 @@ public sealed class BridgeServer : IDisposable
         _dataDir = dataDir;
         Directory.CreateDirectory(dataDir);
         Token = LoadOrCreateToken();
-        _listener = new TcpListener(IPAddress.Any, Port);
+        _listener = new TcpListener(IPAddress.Loopback, Port);
     }
 
     private string TokenPath => Path.Combine(_dataDir, "bridge-token.txt");
@@ -114,7 +133,11 @@ public sealed class BridgeServer : IDisposable
             if (File.Exists(TokenPath))
             {
                 var existing = File.ReadAllText(TokenPath).Trim();
-                if (existing.Length >= 24)
+                // Accept an existing file only if it holds exactly a
+                // token this app would have generated: 64 hex chars
+                // (32 bytes). Anything else — including a weaker value
+                // planted before first run — is replaced, not adopted.
+                if (IsTokenFormat(existing))
                 {
                     return existing;
                 }
@@ -123,15 +146,57 @@ public sealed class BridgeServer : IDisposable
         catch { /* regenerate below */ }
 
         var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-        File.WriteAllText(TokenPath, token);
+        WriteTokenFile(token);
         return token;
     }
 
     public string RegenerateToken()
     {
         Token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-        File.WriteAllText(TokenPath, Token);
+        WriteTokenFile(Token);
         return Token;
+    }
+
+    private static bool IsTokenFormat(string value)
+    {
+        if (value.Length != 64)
+        {
+            return false;
+        }
+        foreach (var c in value)
+        {
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return true;
+    }
+
+    private void WriteTokenFile(string token)
+    {
+        File.WriteAllText(TokenPath, token);
+        SetOwnerOnlyAcl(TokenPath);
+    }
+
+    // The token unlocks the whole bridge, so its file is restricted to
+    // the current user instead of inheriting the folder's default ACL.
+    // Best effort: a failure here must never break token creation.
+    private static void SetOwnerOnlyAcl(string path)
+    {
+        try
+        {
+            var owner = WindowsIdentity.GetCurrent().User;
+            if (owner is null)
+            {
+                return;
+            }
+            var security = new FileSecurity();
+            security.SetOwner(owner);
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            security.AddAccessRule(new FileSystemAccessRule(
+                owner, FileSystemRights.FullControl, AccessControlType.Allow));
+            new FileInfo(path).SetAccessControl(security);
+        }
+        catch { /* token creation matters more than the ACL */ }
     }
 
     public void Start()
@@ -153,6 +218,18 @@ public sealed class BridgeServer : IDisposable
     {
         while (!_stop.IsCancellationRequested)
         {
+            // Take a connection slot before accepting, so at most
+            // MaxConcurrentConnections clients are ever being handled.
+            // Extra callers wait in the listen backlog instead of each
+            // spawning a handler (and, later, a body buffer) of their own.
+            try
+            {
+                await _connectionSlots.WaitAsync(_stop.Token);
+            }
+            catch
+            {
+                break;
+            }
             TcpClient client;
             try
             {
@@ -160,6 +237,7 @@ public sealed class BridgeServer : IDisposable
             }
             catch
             {
+                _connectionSlots.Release();
                 break;
             }
             _ = Task.Run(() => HandleClient(client));
@@ -174,11 +252,12 @@ public sealed class BridgeServer : IDisposable
         public string Path = "";
         public string? Body;
         public string? Auth;
+        public long ContentLength;
         public JsonDocument? Json;
         public JsonElement Root => Json!.RootElement;
     }
 
-    private void HandleClient(TcpClient client)
+    private async Task HandleClient(TcpClient client)
     {
         using (client)
         {
@@ -186,30 +265,61 @@ public sealed class BridgeServer : IDisposable
             {
                 client.ReceiveTimeout = 30000;
                 var stream = client.GetStream();
-                var req = ReadRequest(stream);
+
+                // The request must fully arrive within the deadline, so
+                // a caller dripping headers or a body forever is dropped
+                // instead of holding a connection slot. The deadline
+                // only covers receiving the request: a long-running
+                // route (an exec call, say) may legitimately take
+                // minutes to answer once its request is in.
+                using var deadline = new CancellationTokenSource(
+                    TimeSpan.FromSeconds(RequestReadDeadlineSeconds));
+                var req = await ReadRequestHead(stream, deadline.Token);
                 if (req is null)
                 {
                     return;
                 }
 
+                // Reject a bad token as soon as the headers are in,
+                // before the body buffer is allocated and read.
+                // /health stays open, as before.
+                if (NormalizeRoutePath(req.Path) != "/health" && !IsAuthorized(req))
+                {
+                    RecordAuthFailure(req);
+                    WriteResponse(stream, 401, Err("missing or wrong bridge token"));
+                    return;
+                }
+
+                await ReadRequestBody(stream, req, deadline.Token);
                 var (status, payload) = Dispatch(req);
                 WriteResponse(stream, status, payload);
             }
             catch
             {
-                // Client went away mid-request; nothing useful to do.
+                // Client went away mid-request, or the read deadline
+                // hit; nothing useful to do.
+            }
+            finally
+            {
+                _connectionSlots.Release();
             }
         }
     }
 
-    private static Request? ReadRequest(NetworkStream stream)
+    private static async Task<Request?> ReadRequestHead(NetworkStream stream, CancellationToken deadline)
     {
         // Read headers byte by byte until CRLFCRLF (requests are tiny).
         var headerBytes = new List<byte>();
         var window = new byte[4];
-        int b;
-        while ((b = stream.ReadByte()) != -1)
+        var one = new byte[1];
+        while (true)
         {
+            int n = await stream.ReadAsync(one.AsMemory(0, 1), deadline);
+            if (n <= 0)
+            {
+                break;
+            }
+            int b = one[0];
             headerBytes.Add((byte)b);
             window[0] = window[1]; window[1] = window[2]; window[2] = window[3]; window[3] = (byte)b;
             if (window[0] == '\r' && window[1] == '\n' && window[2] == '\r' && window[3] == '\n')
@@ -262,27 +372,42 @@ public sealed class BridgeServer : IDisposable
             }
         }
 
-        if (contentLength > 0)
+        if (contentLength > MaxBodyBytes)
         {
-            if (contentLength > MaxBodyBytes)
-            {
-                return null;
-            }
-            var buf = new byte[contentLength];
-            int read = 0;
-            while (read < buf.Length)
-            {
-                int n = stream.Read(buf, read, buf.Length - read);
-                if (n <= 0) break;
-                read += n;
-            }
-            req.Body = Encoding.UTF8.GetString(buf, 0, read);
-            if (!string.IsNullOrWhiteSpace(req.Body))
-            {
-                try { req.Json = JsonDocument.Parse(req.Body); } catch { /* leave null */ }
-            }
+            return null;
         }
+        req.ContentLength = contentLength;
         return req;
+    }
+
+    private static async Task ReadRequestBody(NetworkStream stream, Request req, CancellationToken deadline)
+    {
+        if (req.ContentLength <= 0)
+        {
+            return;
+        }
+        var buf = new byte[req.ContentLength];
+        int read = 0;
+        while (read < buf.Length)
+        {
+            int n = await stream.ReadAsync(buf.AsMemory(read, buf.Length - read), deadline);
+            if (n <= 0) break;
+            read += n;
+        }
+        req.Body = Encoding.UTF8.GetString(buf, 0, read);
+        if (!string.IsNullOrWhiteSpace(req.Body))
+        {
+            try { req.Json = JsonDocument.Parse(req.Body); } catch { /* leave null */ }
+        }
+    }
+
+    // The route Dispatch matches on: no trailing slash, and the root
+    // path is /health. The early auth check uses the same form so the
+    // two can never disagree about which requests are /health.
+    private static string NormalizeRoutePath(string path)
+    {
+        var p = path.TrimEnd('/');
+        return p.Length == 0 ? "/health" : p;
     }
 
     private static void WriteResponse(NetworkStream stream, int status, string payload)
@@ -320,18 +445,81 @@ public sealed class BridgeServer : IDisposable
                     path,
                     summary,
                 });
+                RotateLogIfNeeded();
                 File.AppendAllText(LogPath, line + "\n");
             }
         }
         catch { /* logging must never break the bridge */ }
     }
 
-    public string[] RecentLog(int count = 50)
+    // Called with _logLock held, before appending. When the active log
+    // reaches MaxLogBytes, shift the backups (.1 -> .2 -> .3, dropping
+    // the oldest) and move the active file to .1, so logging continues
+    // in a fresh file and the log on disk stays bounded.
+    private void RotateLogIfNeeded()
     {
         try
         {
+            var info = new FileInfo(LogPath);
+            if (!info.Exists || info.Length < MaxLogBytes) return;
+
+            var oldest = LogPath + "." + LogBackupCount;
+            if (File.Exists(oldest)) File.Delete(oldest);
+            for (int i = LogBackupCount - 1; i >= 1; i--)
+            {
+                var source = LogPath + "." + i;
+                if (File.Exists(source)) File.Move(source, LogPath + "." + (i + 1));
+            }
+            File.Move(LogPath, LogPath + ".1");
+        }
+        catch { /* rotation must never break logging */ }
+    }
+
+    public string[] RecentLog(int count = 50)
+    {
+        if (count <= 0) return Array.Empty<string>();
+        try
+        {
             if (!File.Exists(LogPath)) return Array.Empty<string>();
-            var lines = File.ReadAllLines(LogPath);
+
+            // Read backwards from the end of the file in chunks until
+            // enough lines are covered, instead of loading the whole
+            // log into memory just to return its tail.
+            const int ChunkSize = 8192;
+            var chunks = new List<byte[]>();
+            int newlinesNeeded = count + 1;
+            using (var stream = new FileStream(LogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                long remaining = stream.Length;
+                while (remaining > 0 && newlinesNeeded > 0)
+                {
+                    int toRead = (int)Math.Min(ChunkSize, remaining);
+                    remaining -= toRead;
+                    stream.Seek(remaining, SeekOrigin.Begin);
+                    var buffer = new byte[toRead];
+                    int read = 0;
+                    while (read < toRead)
+                    {
+                        int n = stream.Read(buffer, read, toRead - read);
+                        if (n <= 0) break;
+                        read += n;
+                    }
+                    if (read < toRead) Array.Resize(ref buffer, read);
+                    chunks.Add(buffer);
+                    for (int i = read - 1; i >= 0 && newlinesNeeded > 0; i--)
+                    {
+                        if (buffer[i] == (byte)'\n') newlinesNeeded--;
+                    }
+                }
+            }
+
+            using var memory = new MemoryStream();
+            for (int i = chunks.Count - 1; i >= 0; i--)
+            {
+                memory.Write(chunks[i], 0, chunks[i].Length);
+            }
+            var text = Encoding.UTF8.GetString(memory.ToArray());
+            var lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
             return lines.Skip(Math.Max(0, lines.Length - count)).ToArray();
         }
         catch { return Array.Empty<string>(); }
@@ -341,15 +529,14 @@ public sealed class BridgeServer : IDisposable
 
     private (int, string) Dispatch(Request req)
     {
-        var path = req.Path.TrimEnd('/');
-        if (path.Length == 0) path = "/health";
+        var path = NormalizeRoutePath(req.Path);
 
         if (path == "/health")
         {
             return (200, Ok(new { bridge = "muse", version = "2.3.1", running = Running, paused = Paused }));
         }
 
-        if (req.Auth != "Bearer " + Token)
+        if (!IsAuthorized(req))
         {
             RecordAuthFailure(req);
             return (401, Err("missing or wrong bridge token"));
@@ -587,6 +774,36 @@ public sealed class BridgeServer : IDisposable
         return FileEntry(path);
     }
 
+    private const int MaxSearchDepth = 32;
+
+    // Identity of a directory for the search walk: its full path, or —
+    // for a junction or symlink — the full path of its target, so a
+    // link that points back at an ancestor is recognised as a place
+    // the walk has already been instead of a new folder to descend.
+    private static string DirectoryKey(string path)
+    {
+        var full = Path.GetFullPath(path);
+        try
+        {
+            var info = new DirectoryInfo(full);
+            if ((info.Attributes & FileAttributes.ReparsePoint) != 0 && info.LinkTarget is not null)
+            {
+                var target = info.LinkTarget;
+                if (!Path.IsPathFullyQualified(target))
+                {
+                    var parent = Path.GetDirectoryName(full);
+                    if (parent is not null)
+                    {
+                        target = Path.GetFullPath(Path.Combine(parent, target));
+                    }
+                }
+                return target.TrimEnd('\\', '/');
+            }
+        }
+        catch { /* fall back to the plain path */ }
+        return full.TrimEnd('\\', '/');
+    }
+
     private object FilesSearch(Request req)
     {
         var root = RequirePath(req, "root");
@@ -594,11 +811,13 @@ public sealed class BridgeServer : IDisposable
         var max = GetInt(req, "max", 200);
         if (!Directory.Exists(root)) throw new BridgeException("folder not found: " + root);
         var results = new List<object>();
-        var pending = new Stack<string>();
-        pending.Push(root);
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var pending = new Stack<(string Dir, int Depth)>();
+        visited.Add(DirectoryKey(root));
+        pending.Push((root, 0));
         while (pending.Count > 0 && results.Count < max)
         {
-            var dir = pending.Pop();
+            var (dir, depth) = pending.Pop();
             try
             {
                 foreach (var entry in Directory.EnumerateFileSystemEntries(dir, pattern))
@@ -606,9 +825,15 @@ public sealed class BridgeServer : IDisposable
                     results.Add(FileEntry(entry));
                     if (results.Count >= max) break;
                 }
-                foreach (var sub in Directory.EnumerateDirectories(dir))
+                if (depth < MaxSearchDepth)
                 {
-                    pending.Push(sub);
+                    foreach (var sub in Directory.EnumerateDirectories(dir))
+                    {
+                        if (visited.Add(DirectoryKey(sub)))
+                        {
+                            pending.Push((sub, depth + 1));
+                        }
+                    }
                 }
             }
             catch { /* skip unreadable folders */ }
@@ -771,7 +996,9 @@ public sealed class BridgeServer : IDisposable
     private object FilesReveal(Request req)
     {
         var path = RequirePath(req);
-        Process.Start(new ProcessStartInfo("explorer.exe", "/select,\"" + path + "\"") { UseShellExecute = true });
+        var psi = new ProcessStartInfo("explorer.exe") { UseShellExecute = true };
+        psi.ArgumentList.Add("/select," + path);
+        Process.Start(psi);
         return new { path, revealed = true };
     }
 
