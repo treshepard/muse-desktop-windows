@@ -118,9 +118,27 @@ internal static class BridgeApps
         return null;
     }
 
+    // The actions helpers/resolve_helper.py documents and implements.
+    // Checked here, before any process is launched: the action used to
+    // be concatenated into the python command line unquoted, so a
+    // crafted value could break out and add arguments of its own.
+    private static readonly HashSet<string> ResolveActions = new(StringComparer.Ordinal)
+    {
+        "info", "list_projects", "open_project", "create_project",
+        "import_media", "create_bin", "list_media", "create_timeline",
+        "list_timelines", "append_clips", "add_marker", "get_markers",
+        "apply_lut", "apply_cdl", "set_timeline_setting", "render_presets",
+        "add_render_job", "start_render", "render_status", "save_project",
+        "close_project",
+    };
+
     private static object ResolvePython(BridgeServer.Request req)
     {
         var action = BridgeServer.GetString(req, "action");
+        if (!ResolveActions.Contains(action))
+        {
+            throw new Exception("unknown action: " + action);
+        }
         var python = FindPython()
             ?? throw new Exception("No real python.exe found (the Windows Store stub does not count). " +
                                    "Install Python 3.10-3.12 from python.org and retry.");
@@ -142,13 +160,18 @@ internal static class BridgeApps
         var psi = new ProcessStartInfo
         {
             FileName = python,
-            Arguments = "\"" + helper + "\" --action " + action +
-                        " --params \"" + paramsFile + "\" --out \"" + outFile + "\"",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true,
         };
+        psi.ArgumentList.Add(helper);
+        psi.ArgumentList.Add("--action");
+        psi.ArgumentList.Add(action);
+        psi.ArgumentList.Add("--params");
+        psi.ArgumentList.Add(paramsFile);
+        psi.ArgumentList.Add("--out");
+        psi.ArgumentList.Add(outFile);
         // Standard Resolve scripting environment (Windows defaults).
         psi.Environment["RESOLVE_SCRIPT_API"] =
             @"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting";
